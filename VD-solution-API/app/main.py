@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import logging
 import os
+import shutil
 import socket
 import tempfile
 import time
@@ -19,27 +21,30 @@ from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
 APP_NAME = "VD-solution-API"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 API_KEY = os.getenv("API_KEY", "").strip()
-REQUEST_TIMEOUT = int(os.getenv("YT_DLP_SOCKET_TIMEOUT", "20"))
-MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", "500"))
+REQUEST_TIMEOUT = max(5, int(os.getenv("YT_DLP_SOCKET_TIMEOUT", "30")))
+MAX_DOWNLOAD_MB = max(1, int(os.getenv("MAX_DOWNLOAD_MB", "500")))
 MAX_CONCURRENT_EXTRACTIONS = max(1, int(os.getenv("MAX_CONCURRENT_EXTRACTIONS", "2")))
+RATE_LIMIT_PER_MINUTE = max(1, int(os.getenv("RATE_LIMIT_PER_MINUTE", "20")))
 ALLOWED_ORIGINS = [x.strip() for x in os.getenv("CORS_ORIGINS", "*").split(",") if x.strip()]
 
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(APP_NAME)
 _extract_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTIONS)
 _rate_state: dict[str, list[float]] = {}
-RATE_LIMIT_PER_MINUTE = max(1, int(os.getenv("RATE_LIMIT_PER_MINUTE", "20")))
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("%s v%s starting", APP_NAME, APP_VERSION)
     yield
     _rate_state.clear()
 
 
 app = FastAPI(
     title=APP_NAME,
-    description="Android-friendly video metadata, format resolution, and download API.",
+    description="Video metadata and download API for authorized, publicly accessible media.",
     version=APP_VERSION,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -56,7 +61,6 @@ app.add_middleware(
 
 
 def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
-    """If API_KEY is configured, require X-API-Key on API routes."""
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail={
             "code": "invalid_api_key",
@@ -65,7 +69,6 @@ def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
 
 
 def check_rate_limit(request: Request) -> None:
-    """Small per-process guardrail; not a substitute for a distributed rate limiter."""
     client = request.client.host if request.client else "unknown"
     now = time.monotonic()
     recent = [stamp for stamp in _rate_state.get(client, []) if now - stamp < 60]
@@ -89,28 +92,28 @@ def validate_video_url(raw_url: str) -> str:
             "message": "Provide a valid public http:// or https:// video URL."
         })
     host = parsed.hostname.rstrip(".").lower()
-    if host in {"localhost", "localhost.localdomain"} or host.endswith(".localhost") or host.endswith(".local"):
+    if host == "localhost" or host.endswith((".localhost", ".local")):
         raise HTTPException(status_code=400, detail={"code": "private_host_not_allowed", "message": "Local URLs are not allowed."})
     try:
         ip = ipaddress.ip_address(host.strip("[]"))
         if not ip.is_global:
             raise HTTPException(status_code=400, detail={"code": "private_host_not_allowed", "message": "Private or reserved IP addresses are not allowed."})
     except ValueError:
-        # Resolve DNS to reject obvious private-network targets. DNS can change after this check;
-        # the service should still be deployed behind platform-level egress controls if available.
+        # Basic DNS check only; not a complete SSRF defense.
         try:
             addresses = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
             for address in addresses:
-                ip = ipaddress.ip_address(address[4][0])
-                if not ip.is_global:
-                    raise HTTPException(status_code=400, detail={"code": "private_host_not_allowed", "message": "URLs resolving to private or reserved IP addresses are not allowed."})
+                resolved = ipaddress.ip_address(address[4][0])
+                if not resolved.is_global:
+                    raise HTTPException(status_code=400, detail={"code": "private_host_not_allowed", "message": "URL resolves to a private or reserved IP."})
         except socket.gaierror:
-            # Some supported media hosts may not resolve momentarily; yt-dlp will return a useful error.
             pass
     return value
 
 
 def _base_ydl_options() -> dict[str, Any]:
+    # Do not pin a YouTube player_client or force MP4: either can exclude
+    # formats currently offered by the upstream extractor.
     return {
         "quiet": True,
         "no_warnings": True,
@@ -119,20 +122,19 @@ def _base_ydl_options() -> dict[str, Any]:
         "retries": 2,
         "fragment_retries": 2,
         "skip_unavailable_fragments": True,
-        "format": "best[ext=mp4]/best",
         "cachedir": False,
     }
 
 
 def _extract(url: str, *, download: bool = False, outtmpl: str | None = None) -> dict[str, Any]:
     options = _base_ydl_options()
-    options["noplaylist"] = True
-    options["ignoreerrors"] = False
-    options["download"] = download
-    if outtmpl:
-        options["outtmpl"] = outtmpl
+    if download:
+        options["format"] = "bestvideo+bestaudio/best"
+        options["merge_output_format"] = "mp4"
         options["max_filesize"] = MAX_DOWNLOAD_MB * 1024 * 1024
         options["overwrites"] = True
+        if outtmpl:
+            options["outtmpl"] = outtmpl
     with yt_dlp.YoutubeDL(options) as ydl:
         result = ydl.extract_info(url, download=download)
         if not isinstance(result, dict):
@@ -146,7 +148,8 @@ def _format_summary(fmt: dict[str, Any]) -> dict[str, Any]:
         "ext": fmt.get("ext"),
         "format": fmt.get("format"),
         "resolution": fmt.get("resolution") or (
-            f'{fmt.get("width")}x{fmt.get("height")}' if fmt.get("width") and fmt.get("height") else None
+            f'{fmt.get("width")}x{fmt.get("height")}'
+            if fmt.get("width") and fmt.get("height") else None
         ),
         "width": fmt.get("width"),
         "height": fmt.get("height"),
@@ -162,18 +165,17 @@ def _format_summary(fmt: dict[str, Any]) -> dict[str, Any]:
 
 def _metadata(info: dict[str, Any], include_formats: bool = False) -> dict[str, Any]:
     formats = info.get("formats") or []
-    # Prefer a combined MP4 stream so Android can download/play without a merge step.
-    candidates = [
-        f for f in formats
-        if f.get("url") and f.get("ext") == "mp4"
+    combined = [
+        f for f in formats if f.get("url")
         and f.get("vcodec") not in (None, "none")
         and f.get("acodec") not in (None, "none")
     ]
-    if not candidates:
-        candidates = [f for f in formats if f.get("url") and f.get("vcodec") not in (None, "none")]
+    video_only = [f for f in formats if f.get("url") and f.get("vcodec") not in (None, "none")]
+    candidates = combined or video_only
     best = max(candidates, key=lambda f: (f.get("height") or 0, f.get("tbr") or 0), default={})
+    direct_url = best.get("url") or info.get("url")
     payload = {
-        "success": True,
+        "success": bool(direct_url),
         "title": info.get("title") or "Video",
         "id": info.get("id"),
         "webpage_url": info.get("webpage_url"),
@@ -183,10 +185,12 @@ def _metadata(info: dict[str, Any], include_formats: bool = False) -> dict[str, 
         "ext": best.get("ext") or info.get("ext"),
         "filesize": best.get("filesize") or best.get("filesize_approx"),
         "resolution": best.get("resolution") or (
-            f'{best.get("width")}x{best.get("height")}' if best.get("width") and best.get("height") else None
+            f'{best.get("width")}x{best.get("height")}'
+            if best.get("width") and best.get("height") else None
         ),
-        "download_url": best.get("url") or info.get("url"),
-        "note": "Direct media URLs may expire and some formats require separate audio/video streams.",
+        "has_audio": best.get("acodec") not in (None, "none") if best else None,
+        "download_url": direct_url,
+        "note": "Direct URLs may expire. Some high-quality formats have separate audio/video streams; use /api/download for a server-created file.",
     }
     if include_formats:
         payload["formats"] = [_format_summary(f) for f in formats if f.get("url")]
@@ -194,31 +198,35 @@ def _metadata(info: dict[str, Any], include_formats: bool = False) -> dict[str, 
 
 
 def _public_error(exc: Exception) -> HTTPException:
+    logger.exception("Media extraction failed")
     message = str(exc).lower()
-    if "private video" in message or "sign in" in message or "login" in message or "authentication" in message:
-        code, text = "authentication_required", "This video requires sign-in or is private. This API does not bypass access controls."
+    if any(x in message for x in ("private video", "sign in", "login", "authentication required")):
+        code, public = "authentication_required", "This video requires sign-in or is private. Access controls are not bypassed."
     elif "unsupported url" in message or "no suitable extractor" in message:
-        code, text = "unsupported_url", "This URL or platform is not supported by the installed yt-dlp version."
+        code, public = "unsupported_url", "This URL or platform is not supported by the installed yt-dlp version."
+    elif "requested format" in message:
+        code, public = "format_unavailable", "No usable format was selected. Check server logs and update yt-dlp if needed."
     elif "429" in message or "too many requests" in message or "rate limit" in message:
-        code, text = "upstream_rate_limited", "The video platform is rate-limiting requests. Try again later."
+        code, public = "upstream_rate_limited", "The video platform is rate-limiting requests. Try again later."
     elif "geo" in message and ("restrict" in message or "blocked" in message):
-        code, text = "geo_restricted", "This video is not available from the server's region."
+        code, public = "geo_restricted", "This video is not available from the server's region."
     elif "age" in message and ("restrict" in message or "confirm" in message):
-        code, text = "age_restricted", "This video requires age verification."
+        code, public = "age_restricted", "This video requires age verification."
     elif "max-filesize" in message or "file is larger" in message:
-        code, text = "file_too_large", f"Video exceeds the configured {MAX_DOWNLOAD_MB} MB download limit."
+        code, public = "file_too_large", f"Video exceeds the configured {MAX_DOWNLOAD_MB} MB limit."
     else:
-        code, text = "extraction_failed", "Could not process this video. It may be unavailable, restricted, or the platform may have changed."
-    return HTTPException(status_code=422, detail={"code": code, "message": text})
+        code, public = "extraction_failed", "Could not process this media. Check server logs for the underlying cause."
+    return HTTPException(status_code=422, detail={"code": code, "message": public})
 
 
 @app.get("/")
 async def home():
-    return {"status": "online", "service": APP_NAME, "version": APP_VERSION, "docs": "/docs"}
+    return {"status": "online", "service": APP_NAME, "version": APP_VERSION, "docs": "/docs", "health": "/health"}
 
 
 @app.get("/health")
 async def health():
+    # Process health only; does not prove YouTube extraction works.
     return {"status": "ok", "service": APP_NAME, "version": APP_VERSION}
 
 
@@ -228,7 +236,10 @@ async def resolve_media(url: str = Query(..., min_length=8, max_length=4096, des
     try:
         async with _extract_semaphore:
             info = await run_in_threadpool(_extract, safe_url)
-        return _metadata(info)
+        result = _metadata(info)
+        if not result.get("download_url"):
+            raise RuntimeError("Extractor returned metadata but no direct media URL.")
+        return result
     except HTTPException:
         raise
     except Exception as exc:
@@ -249,18 +260,14 @@ async def list_formats(url: str = Query(..., min_length=8, max_length=4096, desc
 
 
 @app.get("/api/download", dependencies=[Depends(require_api_key), Depends(check_rate_limit)])
-async def download_video(
-    url: str = Query(..., min_length=8, max_length=4096, description="Public video page URL"),
-    request: Request = None,
-):
-    """Download a single media file through the API; server storage is temporary."""
+async def download_video(url: str = Query(..., min_length=8, max_length=4096, description="Public video page URL")):
     safe_url = validate_video_url(url)
     tmpdir = tempfile.mkdtemp(prefix="vd_solution_")
-    outtmpl = str(Path(tmpdir) / "%(title).150B-%(id)s.%(ext)s")
+    outtmpl = str(Path(tmpdir) / "%(title).120B-%(id)s.%(ext)s")
     try:
         async with _extract_semaphore:
-            info = await run_in_threadpool(_extract, safe_url, download=True, outtmpl=outtmpl)
-        files = [p for p in Path(tmpdir).glob("*") if p.is_file() and p.name != ".DS_Store"]
+            await run_in_threadpool(_extract, safe_url, download=True, outtmpl=outtmpl)
+        files = [p for p in Path(tmpdir).glob("*") if p.is_file()]
         if not files:
             raise RuntimeError("Download finished without producing a file.")
         file_path = max(files, key=lambda p: p.stat().st_size)
@@ -268,7 +275,6 @@ async def download_video(
             raise HTTPException(status_code=413, detail={"code": "file_too_large", "message": f"Download exceeds {MAX_DOWNLOAD_MB} MB."})
 
         def cleanup() -> None:
-            import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
 
         return FileResponse(
@@ -279,10 +285,8 @@ async def download_video(
             headers={"Cache-Control": "no-store"},
         )
     except HTTPException:
-        import shutil
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise
     except Exception as exc:
-        import shutil
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise _public_error(exc) from None
