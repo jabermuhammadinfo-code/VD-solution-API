@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: vd-solution-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: MAX_DOWNLOAD_MB
+        value: "500"
+      - key: MAX_CONCURRENT_EXTRACTIONS
+        value: "2"
+      - key: RATE_LIMIT_PER_MINUTE
+        value: "20"
