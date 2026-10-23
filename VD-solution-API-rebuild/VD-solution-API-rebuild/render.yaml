@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: vd-solution-api
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: MAX_DOWNLOAD_MB
+        value: "500"
+      - key: YTDLP_SOCKET_TIMEOUT
+        value: "20"
